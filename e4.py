@@ -79,67 +79,180 @@ plt.imshow(image)
 plt.title(class_names[y_train[0]])
 plt.axis("off")
 plt.show()
-import tensorflow as tf
-import numpy as np
-import json
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.applications.vgg16 import preprocess_input
-from sklearn.model_selection import train_test_split
-# Load class labels
-with open("labels.json") as f:
-    data = json.load(f)
-label_map = {item[1]: item[2] for item in data}
-# Load images
-dataset = tf.keras.utils.image_dataset_from_directory(
-    "imagenet_folder",
-    image_size=(224, 224),
-    batch_size=20,
-    shuffle=False
+train_captions = []
+for label in y_train:
+    name = class_names[label].replace("_", " ")
+    caption = "<start> a photo of " + name + " <end>"
+    train_captions.append(caption)
+tokenizer = Tokenizer(
+    filters="",
+    lower=True
 )
-classes = [label_map.get(name, name) for name in dataset.class_names]
+tokenizer.fit_on_texts(train_captions)
+train_sequences = tokenizer.texts_to_sequences(train_captions)
+vocab_size = len(tokenizer.word_index) + 1
+max_length = max(len(seq) for seq in train_sequences)
+print("Vocabulary size:", vocab_size)
+print("Maximum caption length:", max_length)
 
 
 
-# Convert images to arrays
-images = np.concatenate([x.numpy() for x, y in dataset.take(10)])
-labels = np.concatenate([y.numpy() for x, y in dataset.take(10)])
-# Train-test split
-train_images, test_images, train_labels, test_labels = train_test_split(
-    images, labels, test_size=0.2, random_state=42
+
+# Create next-word input and target sequences.
+X_sequences = []
+y_sequences = []
+for seq in train_sequences:
+    X_sequences.append(seq[:-1])
+    y_sequences.append(seq[1:])
+X_sequences = pad_sequences(
+    X_sequences,
+    maxlen=max_length - 1,
+    padding="post"
 )
-# CNN feature extraction
-cnn = VGG16(weights="imagenet", include_top=False, pooling="avg")
-train_features = cnn.predict(preprocess_input(train_images))
-test_features = cnn.predict(preprocess_input(test_images))
-print("CNN Feature Vector:", train_features.shape)
+y_sequences = pad_sequences(
+    y_sequences,
+    maxlen=max_length - 1,
+    padding="post"
+)
+X_sequences = np.array(X_sequences, dtype=np.int32)
+y_sequences = np.array(y_sequences, dtype=np.int32)
 
 
 
-# Reshape for LSTM
-X = train_features.reshape(train_features.shape[0], 1, train_features.shape[1])
-# LSTM model
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(1, 512)),
-    tf.keras.layers.LSTM(64),
-    tf.keras.layers.Dense(len(classes), activation="softmax")
-])
-model.compile(
-    optimizer="adam",
+
+
+# Define CNN+LSTM caption model.
+LSTM_UNITS = 128
+EMBEDDING_DIM = 128
+image_input = Input(
+    shape=(2048,),
+    name="image_features"
+)
+
+caption_input = Input(
+    shape=(max_length - 1,),
+    name="caption_sequence"
+)
+
+image_hidden = Dense(
+    LSTM_UNITS,
+    activation="tanh"
+)(image_input)
+
+image_cell = Dense(
+    LSTM_UNITS,
+    activation="tanh"
+)(image_input)
+
+embedding = Embedding(
+    vocab_size,
+    EMBEDDING_DIM
+)(caption_input)
+
+lstm_output = LSTM(
+    LSTM_UNITS,
+    return_sequences=True
+)(
+    embedding,
+    initial_state=[image_hidden, image_cell]
+)
+
+
+
+
+
+# Predict a vocabulary probability distribution at every time step.
+output = Dense(
+    vocab_size,
+    activation="softmax"
+)(lstm_output)
+
+caption_model = Model(
+    inputs=[image_input, caption_input],
+    outputs=output
+)
+
+caption_model.compile(
+    optimizer=Adam(learning_rate=0.001),
     loss="sparse_categorical_crossentropy",
     metrics=["accuracy"]
 )
-model.fit(X, train_labels, epochs=10)
+
+caption_model.summary()
+caption_history = caption_model.fit(
+    [X_train_features, X_sequences],
+    y_sequences,
+    epochs=10,
+    batch_size=32,
+    validation_split=0.2
+)
 
 
+# ============================================================
+# CAPTION GENERATOR AND PREDICTION
+# ============================================================
+
+def generate_caption(image_path):
+    """Generate a caption one word at a time for a local image."""
+
+    # Load and preprocess image.
+    image = load_preprocess_image(image_path)
+
+    # Extract CNN feature vector.
+    feature = feature_extractor.predict(image, verbose=0)
+
+    # Begin with the start token.
+    caption = ["<start>"]
+
+    for _ in range(max_length - 1):
+
+        # Convert generated words to token IDs.
+        sequence = tokenizer.texts_to_sequences(
+            [" ".join(caption)]
+        )[0]
+
+        current_length = len(sequence)
+
+        # Pad the sequence to the expected input length.
+        padded_sequence = pad_sequences(
+            [sequence],
+            maxlen=max_length - 1,
+            padding="post"
+        )
+
+        # Predict next-word probabilities.
+        predictions = caption_model.predict(
+            [feature, padded_sequence],
+            verbose=0
+        )
+
+        # Choose the highest-probability word at the last real position.
+        next_word_id = np.argmax(
+            predictions[0, current_length - 1, :]
+        )
+
+        next_word = tokenizer.index_word.get(
+            next_word_id,
+            ""
+        )
+
+        # Stop at the end token or an unknown token.
+        if next_word in ("<end>", ""):
+            break
+
+        caption.append(next_word)
+
+    return " ".join(caption[1:])
 
 
-# Prediction
-test_X = test_features.reshape(test_features.shape[0], 1, test_features.shape[1])
-pred = model.predict(test_X)
-for i in range(min(5, len(pred))):
-    predicted_class = classes[np.argmax(pred[i])]
-    expected = "A photo of a " + classes[test_labels[i]] + "."
-    generated = "A photo of a " + predicted_class + "."
-    print("Expected :", expected)
-    print("Generated:", generated)
-    print()
+# Generate and display a caption for a test image.
+test_image = X_test_paths[0]
+generated_caption = generate_caption(test_image)
+
+plt.figure(figsize=(7, 6))
+plt.imshow(load_img(test_image))
+plt.title("Generated: " + generated_caption)
+plt.axis("off")
+plt.show()
+
+print("Generated caption:", generated_caption)
